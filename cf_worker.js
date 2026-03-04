@@ -24,16 +24,21 @@ export default {
   },
 };
 
+// Robust query param extraction to avoid '+' -> ' ' issue with URLSearchParams
+function getParam(url, name) {
+  const match = url.match(new RegExp('[?&]' + name + '=([^&]*)'));
+  return match ? decodeURIComponent(match[1]) : null;
+}
+
 const isOriginAllowed = (origin, env) => {
   if (!origin) return true;
-  const allowedOrigins = (env.ALLOWED_ORIGINS || "*").split(",").map(o => o.trim());
-  return allowedOrigins.includes("*") || allowedOrigins.includes(origin);
+  const allowed = (env.ALLOWED_ORIGINS || "*").split(",").map(o => o.trim());
+  return allowed.includes("*") || allowed.includes(origin);
 };
 
 async function handleM3U8Proxy(request, env) {
-  const { searchParams } = new URL(request.url);
-  const targetUrl = searchParams.get("url");
-  const headersParam = searchParams.get("headers");
+  const targetUrl = getParam(request.url, "url");
+  const headersParam = getParam(request.url, "headers");
   const headers = JSON.parse(headersParam || "{}");
   const origin = request.headers.get("Origin") || "";
 
@@ -46,7 +51,7 @@ async function handleM3U8Proxy(request, env) {
 
   if (!targetUrl) return new Response("URL required", { status: 400 });
 
-  const finalHeaders = {
+  const fetchHeaders = {
     "Referer": env.DEFAULT_REFERER || "https://megacloud.blog",
     "Origin": env.DEFAULT_ORIGIN || "https://hianime.to",
     "User-Agent": request.headers.get("User-Agent") || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
@@ -54,17 +59,17 @@ async function handleM3U8Proxy(request, env) {
   };
 
   try {
-    const response = await fetch(targetUrl, { headers: finalHeaders });
+    const response = await fetch(targetUrl, { headers: fetchHeaders });
     if (!response.ok) return new Response("Fetch failed", { status: response.status, headers: { "Access-Control-Allow-Origin": "*" } });
+
+    // CRITICAL: Use the FINAL URL after redirects for resolving relative paths
+    const finalTargetUrl = response.url || targetUrl;
 
     const m3u8 = await response.text();
     const lines = m3u8.split(/\r?\n/);
     const newLines = [];
 
-    const urlObj = new URL(request.url);
-    const workerUrl = `${urlObj.protocol}//${urlObj.host}`;
-
-    const isMaster = m3u8.includes("#EXT-X-STREAM-INF");
+    const isMaster = m3u8.includes("#EXT-X-STREAM-INF") || m3u8.includes("RESOLUTION=");
 
     for (let line of lines) {
       const trimmedLine = line.trim();
@@ -78,10 +83,12 @@ async function handleM3U8Proxy(request, env) {
           const uriMatch = trimmedLine.match(/URI=["']?([^"']+)["']?/);
           if (uriMatch) {
             const originalUri = uriMatch[1];
-            const absoluteUri = new URL(originalUri, targetUrl).href;
+            // Resolve against finalTargetUrl
+            const absoluteUri = new URL(originalUri, finalTargetUrl).href;
             const isPlaylist = trimmedLine.includes("TYPE=AUDIO") || trimmedLine.includes("TYPE=SUBTITLES") || originalUri.includes(".m3u8");
             const proxyPath = isPlaylist ? "/m3u8-proxy" : "/ts-proxy";
-            const newUrl = `${workerUrl}${proxyPath}?url=${encodeURIComponent(absoluteUri)}${headersParam ? `&headers=${encodeURIComponent(headersParam)}` : ""}`;
+            // Use relative path for worker proxying
+            const newUrl = `${proxyPath}?url=${encodeURIComponent(absoluteUri)}${headersParam ? `&headers=${encodeURIComponent(headersParam)}` : ""}`;
             newLines.push(line.replace(originalUri, newUrl));
           } else {
             newLines.push(line);
@@ -90,10 +97,11 @@ async function handleM3U8Proxy(request, env) {
           newLines.push(line);
         }
       } else {
-        const absoluteUri = new URL(trimmedLine, targetUrl).href;
+        // Resolve segment URL against finalTargetUrl
+        const absoluteUri = new URL(trimmedLine, finalTargetUrl).href;
         const isM3U8 = trimmedLine.includes(".m3u8") || isMaster;
         const proxyPath = isM3U8 ? "/m3u8-proxy" : "/ts-proxy";
-        const newUrl = `${workerUrl}${proxyPath}?url=${encodeURIComponent(absoluteUri)}${headersParam ? `&headers=${encodeURIComponent(headersParam)}` : ""}`;
+        const newUrl = `${proxyPath}?url=${encodeURIComponent(absoluteUri)}${headersParam ? `&headers=${encodeURIComponent(headersParam)}` : ""}`;
         newLines.push(newUrl);
       }
     }
@@ -104,6 +112,8 @@ async function handleM3U8Proxy(request, env) {
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Headers": "*",
         "Access-Control-Allow-Methods": "*",
+        "x-request-url": targetUrl,
+        "x-final-url": finalTargetUrl
       },
     });
   } catch (e) {
@@ -112,9 +122,8 @@ async function handleM3U8Proxy(request, env) {
 }
 
 async function handleTsProxy(request, env) {
-  const { searchParams } = new URL(request.url);
-  const targetUrl = searchParams.get("url");
-  const headers = JSON.parse(searchParams.get("headers") || "{}");
+  const targetUrl = getParam(request.url, "url");
+  const headers = JSON.parse(getParam(request.url, "headers") || "{}");
   const origin = request.headers.get("Origin") || "";
 
   if (!isOriginAllowed(origin, env)) {
@@ -147,6 +156,8 @@ async function handleTsProxy(request, env) {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Headers": "*",
       "Access-Control-Allow-Methods": "*",
+      "x-request-url": targetUrl,
+      "x-final-url": response.url || targetUrl
     });
 
     const headersToForward = ["Content-Type", "Content-Length", "Content-Range", "Accept-Ranges", "Cache-Control"];
