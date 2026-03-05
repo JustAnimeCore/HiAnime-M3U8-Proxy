@@ -39,7 +39,12 @@ const isOriginAllowed = (origin, env) => {
 async function handleM3U8Proxy(request, env) {
   const targetUrl = getParam(request.url, "url");
   const headersParam = getParam(request.url, "headers");
-  const headers = JSON.parse(headersParam || "{}");
+  let headers = {};
+  try {
+    headers = JSON.parse(headersParam || "{}");
+  } catch (e) {
+    console.error("Failed to parse headers", e);
+  }
   const origin = request.headers.get("Origin") || "";
 
   if (!isOriginAllowed(origin, env)) {
@@ -51,26 +56,53 @@ async function handleM3U8Proxy(request, env) {
 
   if (!targetUrl) return new Response("URL required", { status: 400 });
 
+  // STEALTH: Use the exact User-Agent from the local proxy
   const fetchHeaders = {
     "Referer": env.DEFAULT_REFERER || "https://megacloud.blog",
     "Origin": env.DEFAULT_ORIGIN || "https://hianime.to",
-    "User-Agent": request.headers.get("User-Agent") || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    ...headers
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/80.0.3987.132 Safari/537.36",
   };
+
+  // Only allow "safe" headers to avoid proxy detection
+  const safeHeaders = ["Accept", "Accept-Language", "Cache-Control", "Pragma"];
+  Object.keys(headers).forEach(h => {
+    if (safeHeaders.includes(h)) fetchHeaders[h] = headers[h];
+  });
 
   try {
     const response = await fetch(targetUrl, { headers: fetchHeaders });
-    if (!response.ok) return new Response("Fetch failed", { status: response.status, headers: { "Access-Control-Allow-Origin": "*" } });
-
     const finalTargetUrl = response.url || targetUrl;
+
+    // If blocked, Cloudflare/CDNs often return 403 but sometimes 200 with a challenge page
+    if (!response.ok) {
+      return new Response(`Upstream returned ${response.status}`, {
+        status: response.status,
+        headers: {
+          "Access-Control-Allow-Origin": "*",
+          "x-debug-status": response.status.toString()
+        }
+      });
+    }
+
     const workerUrl = new URL(request.url);
     const workerBaseUrl = `${workerUrl.protocol}//${workerUrl.host}`;
 
     const m3u8 = await response.text();
+    const debugPeek = m3u8.substring(0, 100).replace(/\r?\n/g, " ");
+
+    // Verify it's actually an M3U8
+    if (!m3u8.trim().startsWith("#EXTM3U")) {
+      return new Response(m3u8, {
+        headers: {
+          "Content-Type": "text/html",
+          "Access-Control-Allow-Origin": "*",
+          "x-debug-peek": "INVALID_M3U8: " + debugPeek
+        }
+      });
+    }
+
     const lines = m3u8.split(/\r?\n/);
     const newLines = [];
-
-    // Context detection: Is this a master playlist or a media playlist?
     const isMaster = m3u8.includes("#EXT-X-STREAM-INF") || m3u8.includes("RESOLUTION=");
 
     for (let line of lines) {
@@ -82,7 +114,6 @@ async function handleM3U8Proxy(request, env) {
 
       if (trimmedLine.startsWith("#")) {
         if (trimmedLine.startsWith("#EXT-X-KEY:") || trimmedLine.startsWith("#EXT-X-MEDIA:")) {
-          // Robust URI attribute replacement
           const newLine = line.replace(/URI=["']?([^"'\s,]+)["']?/, (match, originalUri) => {
             const absoluteUri = new URL(originalUri, finalTargetUrl).href;
             const isPlaylist = line.includes("TYPE=AUDIO") || line.includes("TYPE=SUBTITLES") || originalUri.includes(".m3u8");
@@ -96,10 +127,7 @@ async function handleM3U8Proxy(request, env) {
         }
       } else {
         const absoluteUri = new URL(trimmedLine, finalTargetUrl).href;
-        // If it's a master playlist, non-comment lines are child manifests.
-        // If it's a media playlist, non-comment lines are segments.
         const proxyPath = isMaster ? "/m3u8-proxy" : "/ts-proxy";
-
         const newProxiedUrl = `${workerBaseUrl}${proxyPath}?url=${encodeURIComponent(absoluteUri)}${headersParam ? `&headers=${encodeURIComponent(headersParam)}` : ""}`;
         newLines.push(newProxiedUrl);
       }
@@ -112,8 +140,8 @@ async function handleM3U8Proxy(request, env) {
         "Access-Control-Allow-Headers": "*",
         "Access-Control-Allow-Methods": "*",
         "Cache-Control": "no-cache",
-        "x-request-url": targetUrl,
-        "x-final-url": finalTargetUrl
+        "x-debug-peek": debugPeek,
+        "x-request-url": targetUrl
       },
     });
   } catch (e) {
@@ -123,7 +151,11 @@ async function handleM3U8Proxy(request, env) {
 
 async function handleTsProxy(request, env) {
   const targetUrl = getParam(request.url, "url");
-  const headers = JSON.parse(getParam(request.url, "headers") || "{}");
+  const headersParam = getParam(request.url, "headers");
+  let headers = {};
+  try {
+    headers = JSON.parse(headersParam || "{}");
+  } catch (e) { }
   const origin = request.headers.get("Origin") || "";
 
   if (!isOriginAllowed(origin, env)) {
@@ -136,15 +168,16 @@ async function handleTsProxy(request, env) {
   if (!targetUrl) return new Response("URL required", { status: 400 });
 
   const forwardHeaders = new Headers({
-    "User-Agent": request.headers.get("User-Agent") || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/80.0.3987.132 Safari/537.36",
     "Referer": env.DEFAULT_REFERER || "https://megacloud.blog",
     "Origin": env.DEFAULT_ORIGIN || "https://hianime.to",
-    ...headers
   });
 
   if (request.headers.has("Range")) {
     forwardHeaders.set("Range", request.headers.get("Range"));
   }
+  // Also check passed headers for Range
+  if (headers["Range"]) forwardHeaders.set("Range", headers["Range"]);
 
   try {
     const response = await fetch(targetUrl, {
@@ -157,8 +190,8 @@ async function handleTsProxy(request, env) {
       "Access-Control-Allow-Headers": "*",
       "Access-Control-Allow-Methods": "*",
       "Cache-Control": "public, max-age=3600",
-      "x-request-url": targetUrl,
-      "x-final-url": response.url || targetUrl
+      "x-debug-status": response.status.toString(),
+      "x-request-url": targetUrl
     });
 
     const headersToForward = ["Content-Type", "Content-Length", "Content-Range", "Accept-Ranges", "Last-Modified", "ETag"];
@@ -166,7 +199,7 @@ async function handleTsProxy(request, env) {
       if (response.headers.has(h)) responseHeaders.set(h, response.headers.get(h));
     });
 
-    // Force correct content-type for segments and keys (matching local proxy behavior)
+    // Determine correct content-type
     if (targetUrl.includes(".m3u8")) {
       responseHeaders.set("Content-Type", "application/vnd.apple.mpegurl");
     } else if (targetUrl.includes(".ts")) {
