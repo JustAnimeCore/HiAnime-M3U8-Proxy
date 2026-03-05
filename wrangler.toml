@@ -1,4 +1,4 @@
-name = "hianime-m3u8-proxy"
+name = "hianime"
 main = "cf_worker.js"
 compatibility_date = "2024-03-04"
 
