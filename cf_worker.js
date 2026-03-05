@@ -62,14 +62,13 @@ async function handleM3U8Proxy(request, env) {
     const response = await fetch(targetUrl, { headers: fetchHeaders });
     if (!response.ok) return new Response("Fetch failed", { status: response.status, headers: { "Access-Control-Allow-Origin": "*" } });
 
-    // CRITICAL: Use the FINAL URL after redirects for resolving relative paths
     const finalTargetUrl = response.url || targetUrl;
+    const workerUrl = new URL(request.url);
+    const workerBaseUrl = `${workerUrl.protocol}//${workerUrl.host}`;
 
     const m3u8 = await response.text();
     const lines = m3u8.split(/\r?\n/);
     const newLines = [];
-
-    const isMaster = m3u8.includes("#EXT-X-STREAM-INF") || m3u8.includes("RESOLUTION=");
 
     for (let line of lines) {
       const trimmedLine = line.trim();
@@ -83,26 +82,27 @@ async function handleM3U8Proxy(request, env) {
           const uriMatch = trimmedLine.match(/URI=["']?([^"']+)["']?/);
           if (uriMatch) {
             const originalUri = uriMatch[1];
-            // Resolve against finalTargetUrl
             const absoluteUri = new URL(originalUri, finalTargetUrl).href;
             const isPlaylist = trimmedLine.includes("TYPE=AUDIO") || trimmedLine.includes("TYPE=SUBTITLES") || originalUri.includes(".m3u8");
             const proxyPath = isPlaylist ? "/m3u8-proxy" : "/ts-proxy";
-            // Use relative path for worker proxying
-            const newUrl = `${proxyPath}?url=${encodeURIComponent(absoluteUri)}${headersParam ? `&headers=${encodeURIComponent(headersParam)}` : ""}`;
-            newLines.push(line.replace(originalUri, newUrl));
+
+            const newProxiedUrl = `${workerBaseUrl}${proxyPath}?url=${encodeURIComponent(absoluteUri)}${headersParam ? `&headers=${encodeURIComponent(headersParam)}` : ""}`;
+            newLines.push(line.replace(originalUri, newProxiedUrl));
           } else {
             newLines.push(line);
           }
+        } else if (trimmedLine.startsWith("#EXT-X-STREAM-INF")) {
+          newLines.push(line);
         } else {
           newLines.push(line);
         }
       } else {
-        // Resolve segment URL against finalTargetUrl
         const absoluteUri = new URL(trimmedLine, finalTargetUrl).href;
-        const isM3U8 = trimmedLine.includes(".m3u8") || isMaster;
+        const isM3U8 = trimmedLine.includes(".m3u8");
         const proxyPath = isM3U8 ? "/m3u8-proxy" : "/ts-proxy";
-        const newUrl = `${proxyPath}?url=${encodeURIComponent(absoluteUri)}${headersParam ? `&headers=${encodeURIComponent(headersParam)}` : ""}`;
-        newLines.push(newUrl);
+
+        const newProxiedUrl = `${workerBaseUrl}${proxyPath}?url=${encodeURIComponent(absoluteUri)}${headersParam ? `&headers=${encodeURIComponent(headersParam)}` : ""}`;
+        newLines.push(newProxiedUrl);
       }
     }
 
@@ -148,7 +148,7 @@ async function handleTsProxy(request, env) {
 
   try {
     const response = await fetch(targetUrl, {
-      method: request.method,
+      method: request.method === "OPTIONS" ? "GET" : request.method,
       headers: forwardHeaders,
     });
 
@@ -165,9 +165,20 @@ async function handleTsProxy(request, env) {
       if (response.headers.has(h)) responseHeaders.set(h, response.headers.get(h));
     });
 
-    if (!responseHeaders.has("Content-Type")) {
-      responseHeaders.set("Content-Type", targetUrl.includes(".m4s") ? "video/iso.segment" : "video/mp2t");
+    // Determine correct content-type if missing or incorrect
+    let contentType = responseHeaders.get("Content-Type");
+    if (!contentType || contentType === "text/plain") {
+      if (targetUrl.includes(".m3u8")) {
+        contentType = "application/vnd.apple.mpegurl";
+      } else if (targetUrl.includes(".ts")) {
+        contentType = "video/mp2t";
+      } else if (targetUrl.includes(".m4s")) {
+        contentType = "video/iso.segment";
+      } else if (targetUrl.includes("key") || targetUrl.includes(".key")) {
+        contentType = "application/octet-stream";
+      }
     }
+    if (contentType) responseHeaders.set("Content-Type", contentType);
 
     return new Response(response.body, {
       status: response.status,
