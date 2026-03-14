@@ -1,8 +1,0 @@
-name = "hianime-m3u8-proxy"
-main = "cf_worker.js"
-compatibility_date = "2024-03-04"
-
-[vars]
-DEFAULT_REFERER = "https://megacloud.blog"
-DEFAULT_ORIGIN = "https://hianime.to"
-ALLOWED_ORIGINS = "https://justanime.to,https://www.justanime.to,http://localhost:5173"
